@@ -49,6 +49,16 @@ const int freq = 38000;
 const int ledChannel = 0;
 const int resolution = 8;
 
+const char* firmwareUrl = "https://github.com/banuch/gitbux_ota/releases/download/esp32_firmware/frimware.ino.bin";
+const char* versionUrl = "https://raw.githubusercontent.com/banuch/gitbux_ota/refs/heads/master/frimware/version.txt";
+
+// Current firmware version
+const char* currentFirmwareVersion = "1.0.4";
+const unsigned long updateCheckInterval = 5 * 60 * 1000;  // 5 minutes in milliseconds
+unsigned long lastUpdateCheck = 0;
+
+
+
 byte message1[] = { 0x95, 0x95, 0xFF, 0xFF, 0xFF, 0x0B, 0x96, 0x31, 0x11, 0x05, 0x00 };
 byte message2[] = { 0x95, 0x95, 0xFF, 0xFF, 0xFF, 0x0B, 0x00, 0x31, 0x11, 0x05, 0x00 };
 byte message5[] = { 0x95, 0x95, 0xFF, 0xFF, 0xFF, 0x0B, 0x01, 0x31, 0x11, 0x05, 0x00 };
@@ -257,6 +267,139 @@ void get_key_status() {
 // ============================================================
 //  OTA
 // ============================================================
+
+
+void checkForFirmwareUpdate() {
+  Serial.println("Checking for firmware update...");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected");
+    return;
+  }
+
+  // Step 1: Fetch the latest version from GitHub
+  String latestVersion = fetchLatestVersion();
+  if (latestVersion == "") {
+    Serial.println("Failed to fetch latest version");
+    return;
+  }
+
+  Serial.println("Current Firmware Version: " + String(currentFirmwareVersion));
+  Serial.println("Latest Firmware Version: " + latestVersion);
+
+  // Step 2: Compare versions
+  if (latestVersion != currentFirmwareVersion) {
+    Serial.println("New firmware available. Starting OTA update...");
+    downloadAndApplyFirmware();
+  } else {
+    Serial.println("Device is up to date.");
+  }
+}
+
+String fetchLatestVersion() {
+  HTTPClient http;
+  http.begin(versionUrl);
+
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String latestVersion = http.getString();
+    latestVersion.trim();  // Remove any extra whitespace
+    http.end();
+    return latestVersion;
+  } else {
+    Serial.printf("Failed to fetch version. HTTP code: %d\n", httpCode);
+    http.end();
+    return "";
+  }
+}
+
+void downloadAndApplyFirmware() {
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(firmwareUrl);
+
+  int httpCode = http.GET();
+  Serial.printf("HTTP GET code: %d\n", httpCode);
+
+  if (httpCode == HTTP_CODE_OK) {
+    int contentLength = http.getSize();
+    Serial.printf("Firmware size: %d bytes\n", contentLength);
+
+    if (contentLength > 0) {
+      WiFiClient* stream = http.getStreamPtr();
+      if (startOTAUpdate(stream, contentLength)) {
+        Serial.println("OTA update successful, restarting...");
+        delay(2000);
+        ESP.restart();
+      } else {
+        Serial.println("OTA update failed");
+      }
+    } else {
+      Serial.println("Invalid firmware size");
+    }
+  } else {
+    Serial.printf("Failed to fetch firmware. HTTP code: %d\n", httpCode);
+  }
+  http.end();
+}
+
+
+bool startOTAUpdate(WiFiClient* client, int contentLength) {
+  Serial.println("Initializing update...");
+  if (!Update.begin(contentLength)) {
+    Serial.printf("Update begin failed: %s\n", Update.errorString());
+    return false;
+  }
+
+  Serial.println("Writing firmware...");
+  size_t written = 0;
+  int progress = 0;
+  int lastProgress = 0;
+
+  // Timeout variables
+  const unsigned long timeoutDuration = 120*1000;  // 10 seconds timeout
+  unsigned long lastDataTime = millis();
+
+  while (written < contentLength) {
+    if (client->available()) {
+      uint8_t buffer[128];
+      size_t len = client->read(buffer, sizeof(buffer));
+      if (len > 0) {
+        Update.write(buffer, len);
+        written += len;
+
+        // Calculate and print progress
+        progress = (written * 100) / contentLength;
+        if (progress != lastProgress) {
+          Serial.printf("Writing Progress: %d%%\n", progress);
+          lastProgress = progress;
+        }
+      }
+    }
+    // Check for timeout
+    if (millis() - lastDataTime > timeoutDuration) {
+      Serial.println("Timeout: No data received for too long. Aborting update...");
+      Update.abort();
+      return false;
+    }
+
+    yield();
+  }
+  Serial.println("\nWriting complete");
+
+  if (written != contentLength) {
+    Serial.printf("Error: Write incomplete. Expected %d but got %d bytes\n", contentLength, written);
+    Update.abort();
+    return false;
+  }
+
+  if (!Update.end()) {
+    Serial.printf("Error: Update end failed: %s\n", Update.errorString());
+    return false;
+  }
+
+  Serial.println("Update successfully completed");
+  return true;
+}
 
 void update_firmware() {
   char SSID[20]; char PASSWORD[20];
@@ -530,7 +673,7 @@ void processCommand() {
     if (cmd == "update_password")  { ledon(); beep1(); update_password(paramVal);  ledoff(); return; }
     if (cmd == "update_ipaddress") { ledon(); beep1(); update_ipaddress(paramVal); ledoff(); return; }
     if (cmd == "update_port")      { ledon(); beep1(); update_port(paramVal);      ledoff(); return; }
-    if (cmd == "update_firmware")  { ledon(); beep1(); update_firmware();          ledoff(); return; }
+    if (cmd == "update_firmware")  { ledon(); beep1(); checkForFirmwareUpdate();          ledoff(); return; }
     if (cmd == "get_config")       { ledon(); beep1(); ReadAllValues();            ledoff(); return; }
 
     if (cmd == "get_battery") {
@@ -574,7 +717,7 @@ void processCommand() {
   if (readString.indexOf("update_password")  != -1) { ledon(); beep1(); update_password();  ledoff(); }
   if (readString.indexOf("update_ipaddress") != -1) { ledon(); beep1(); update_ipaddress(); ledoff(); }
   if (readString.indexOf("update_port")      != -1) { ledon(); beep1(); update_port();      ledoff(); }
-  if (readString.indexOf("update_firmware")  != -1) { ledon(); beep1(); update_firmware();  ledoff(); }
+  if (readString.indexOf("update_firmware")  != -1) { ledon(); beep1(); checkForFirmwareUpdate();  ledoff(); }
   if (readString.indexOf("get_config")       != -1) { ledon(); beep1(); ReadAllValues();    ledoff(); }
 
   if (readString == "#IRDA1*")     { ledon(); beep1(); meter_flag=1; delay(2); delay(10); IRDA2400(); IRDA1_PHASE();   ledoff(); beep2(); digitalWrite(irdaen,1); }
